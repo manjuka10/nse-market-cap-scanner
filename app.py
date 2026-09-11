@@ -176,11 +176,16 @@ def normalize_market_cap_report(raw):
         None,
     )
 
+    # Current NSE mcap file uses:
+    #   Symbol
+    #   Security Name
+    #   Market Cap(Rs.)
+    # Market Cap(Rs.) is in rupees, so convert to ₹ crore.
     cap_col = next(
         (
             c for c in df.columns
-            if "market" in c.lower()
-            and "capital" in c.lower()
+            if "market cap" in c.lower()
+            and "weight" not in c.lower()
         ),
         None,
     )
@@ -199,7 +204,8 @@ def normalize_market_cap_report(raw):
         .str.upper()
     )
 
-    out["Market Cap (₹ Cr)"] = pd.to_numeric(
+    # NSE's Market Cap(Rs.) is rupees.
+    market_cap_rupees = pd.to_numeric(
         df[cap_col]
         .astype(str)
         .str.replace(",", "", regex=False)
@@ -207,6 +213,8 @@ def normalize_market_cap_report(raw):
         .str.strip(),
         errors="coerce",
     )
+
+    out["Market Cap (₹ Cr)"] = market_cap_rupees / 10_000_000
 
     return (
         out
