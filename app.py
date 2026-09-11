@@ -14,17 +14,19 @@ st.set_page_config(
 )
 
 NSE_HOME = "https://www.nseindia.com"
-NSE_ARCHIVE = "https://nsearchives.nseindia.com"
+NSE_ARCHIVES = "https://nsearchives.nseindia.com"
 
 INDEX_FILES = {
-    "NIFTY 50": f"{NSE_ARCHIVE}/content/indices/ind_nifty50list.csv",
-    "NIFTY 100": f"{NSE_ARCHIVE}/content/indices/ind_nifty100list.csv",
+    "NIFTY 50": f"{NSE_ARCHIVES}/content/indices/ind_nifty50list.csv",
+    "NIFTY 100": f"{NSE_ARCHIVES}/content/indices/ind_nifty100list.csv",
 }
 
 HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                  "AppleWebKit/537.36 (KHTML, like Gecko) "
-                  "Chrome/139.0.0.0 Safari/537.36",
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/139.0.0.0 Safari/537.36"
+    ),
     "Accept-Language": "en-US,en;q=0.9",
     "Accept": "text/html,application/xhtml+xml,application/json,*/*",
     "Referer": NSE_HOME + "/",
@@ -34,6 +36,7 @@ HEADERS = {
 def nse_get(url, timeout=30):
     s = requests.Session(impersonate="chrome")
     s.headers.update(HEADERS)
+    s.get(NSE_HOME, timeout=20)
     r = s.get(url, timeout=timeout)
     r.raise_for_status()
     return r
@@ -46,7 +49,8 @@ def get_constituents(universe):
     df.columns = [str(c).strip() for c in df.columns]
 
     symbol_col = next(
-        (c for c in df.columns if c.lower() == "symbol"), None
+        (c for c in df.columns if c.lower() == "symbol"),
+        None,
     )
     company_col = next(
         (
@@ -57,20 +61,20 @@ def get_constituents(universe):
     )
 
     if symbol_col is None:
-        raise RuntimeError("NSE index file does not contain a Symbol column.")
+        raise RuntimeError("NSE index CSV does not contain a Symbol column.")
 
     out = pd.DataFrame()
     out["Symbol"] = df[symbol_col].astype(str).str.strip().str.upper()
-    out["Company"] = (
-        df[company_col].astype(str).str.strip()
-        if company_col
-        else out["Symbol"]
-    )
+
+    if company_col:
+        out["Company"] = df[company_col].astype(str).str.strip()
+    else:
+        out["Company"] = out["Symbol"]
 
     return out.drop_duplicates("Symbol").reset_index(drop=True)
 
 
-def trading_dates_back(start_date, count=10):
+def recent_weekdays(start_date, count=8):
     dates = []
     d = start_date
 
@@ -83,70 +87,75 @@ def trading_dates_back(start_date, count=10):
 
 
 @st.cache_data(ttl=300)
-def get_nse_market_cap_report():
+def get_market_cap_report():
     """
-    NSE's official PR bundle contains:
+    NSE's official PR Bhavcopy ZIP contains:
         mcapDDMMYYYY.csv
 
-    This is the NSE security-wise market-cap report. We download the
-    latest available trading-day PR bundle and extract only its mcap file.
+    The current NSE archive location is:
+        /archives/equities/bhavcopy/pr/PR{DDMMYY}.zip
+
+    The mcap file contains security-wise full market capitalisation.
     """
     today = datetime.now(ZoneInfo("Asia/Kolkata")).date()
-
     errors = []
 
-    for d in trading_dates_back(today, count=8):
-        ddmmyyyy = d.strftime("%d%m%Y")
+    for d in recent_weekdays(today):
         ddmmyy = d.strftime("%d%m%y")
-        month = d.strftime("%b").upper()
+        ddmmyyyy = d.strftime("%d%m%Y")
 
-        # NSE PR archive pattern.
-        url = (
-            f"{NSE_ARCHIVE}/content/historical/EQUITIES/"
-            f"{d.year}/{month}/PR{ddmmyy}.zip"
-        )
+        # Current NSE archive URL.
+        urls = [
+            f"{NSE_ARCHIVES}/archives/equities/bhavcopy/pr/PR{ddmmyy}.zip",
+            # Fallback archive location used by older NSE archive pages.
+            (
+                f"{NSE_ARCHIVES}/content/historical/EQUITIES/"
+                f"{d.year}/{d.strftime('%b').upper()}/PR{ddmmyy}.zip"
+            ),
+        ]
 
-        try:
-            r = nse_get(url, timeout=40)
+        for url in urls:
+            try:
+                r = nse_get(url, timeout=40)
 
-            with zipfile.ZipFile(io.BytesIO(r.content)) as z:
-                names = z.namelist()
+                with zipfile.ZipFile(io.BytesIO(r.content)) as z:
+                    names = z.namelist()
 
-                target = next(
-                    (
-                        name for name in names
-                        if name.lower().endswith(f"mcap{ddmmyyyy}.csv")
-                    ),
-                    None,
-                )
-
-                # Be tolerant of an unexpected internal path/name.
-                if target is None:
                     target = next(
                         (
                             name for name in names
-                            if "mcap" in name.lower()
-                            and name.lower().endswith(".csv")
+                            if name.lower() == f"mcap{ddmmyyyy}.csv"
                         ),
                         None,
                     )
 
-                if target is None:
-                    raise RuntimeError(
-                        "NSE PR bundle was downloaded but its mcap CSV was not found."
-                    )
+                    if target is None:
+                        target = next(
+                            (
+                                name for name in names
+                                if "mcap" in name.lower()
+                                and name.lower().endswith(".csv")
+                            ),
+                            None,
+                        )
 
-                with z.open(target) as f:
-                    raw = pd.read_csv(f)
+                    if target is None:
+                        raise RuntimeError(
+                            "The NSE PR ZIP was downloaded, but the "
+                            "security-wise mcap CSV was not found."
+                        )
 
-            return raw, d
+                    with z.open(target) as f:
+                        raw = pd.read_csv(f)
 
-        except Exception as e:
-            errors.append(f"{d}: {e}")
+                return raw, d
+
+            except Exception as e:
+                errors.append(f"{d} ({url}): {e}")
 
     raise RuntimeError(
-        "Could not retrieve an NSE market-cap report from the recent "
-        "trading-day archives. " + " | ".join(errors[-3:])
+        "Could not retrieve the NSE market-cap report from the recent "
+        "trading-day archives. " + " | ".join(errors[-4:])
     )
 
 
@@ -154,7 +163,6 @@ def normalize_market_cap_report(raw):
     df = raw.copy()
     df.columns = [str(c).strip() for c in df.columns]
 
-    # Find the security symbol column.
     symbol_col = next(
         (
             c for c in df.columns
@@ -168,7 +176,6 @@ def normalize_market_cap_report(raw):
         None,
     )
 
-    # Find market-cap column.
     cap_col = next(
         (
             c for c in df.columns
@@ -180,7 +187,7 @@ def normalize_market_cap_report(raw):
 
     if symbol_col is None or cap_col is None:
         raise RuntimeError(
-            "NSE market-cap report format changed. "
+            "NSE mcap report format changed. "
             f"Columns received: {list(df.columns)}"
         )
 
@@ -201,12 +208,16 @@ def normalize_market_cap_report(raw):
         errors="coerce",
     )
 
-    return out.dropna(subset=["Market Cap (₹ Cr)"]).drop_duplicates("Symbol")
+    return (
+        out
+        .dropna(subset=["Market Cap (₹ Cr)"])
+        .drop_duplicates("Symbol")
+    )
 
 
 def build_table(universe):
     constituents = get_constituents(universe)
-    raw, report_date = get_nse_market_cap_report()
+    raw, report_date = get_market_cap_report()
     market_caps = normalize_market_cap_report(raw)
 
     out = constituents.merge(
@@ -240,15 +251,10 @@ with col1:
     )
 
 with col2:
-    refresh = st.button(
-        "🔄 Refresh",
-        use_container_width=True,
-    )
-
-if refresh:
-    get_constituents.clear()
-    get_nse_market_cap_report.clear()
-    st.rerun()
+    if st.button("🔄 Refresh", use_container_width=True):
+        get_constituents.clear()
+        get_market_cap_report.clear()
+        st.rerun()
 
 try:
     table, report_date = build_table(universe)
@@ -284,9 +290,8 @@ try:
 
     if missing:
         st.warning(
-            f"NSE market-cap data was not available for {missing} "
-            "constituent(s) in the selected universe. "
-            "Those rows are left blank."
+            f"NSE did not return market-cap data for {missing} "
+            "constituent(s). Those rows are left blank."
         )
 
 except Exception as e:
