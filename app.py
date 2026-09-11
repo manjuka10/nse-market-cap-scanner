@@ -1,6 +1,6 @@
 import io
-from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import datetime
+import zipfile
+from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
 import pandas as pd
@@ -14,11 +14,11 @@ st.set_page_config(
 )
 
 NSE_HOME = "https://www.nseindia.com"
-NSE_ARCHIVE = "https://nsearchives.nseindia.com/content/indices"
+NSE_ARCHIVE = "https://nsearchives.nseindia.com"
 
 INDEX_FILES = {
-    "NIFTY 50": f"{NSE_ARCHIVE}/ind_nifty50list.csv",
-    "NIFTY 100": f"{NSE_ARCHIVE}/ind_nifty100list.csv",
+    "NIFTY 50": f"{NSE_ARCHIVE}/content/indices/ind_nifty50list.csv",
+    "NIFTY 100": f"{NSE_ARCHIVE}/content/indices/ind_nifty100list.csv",
 }
 
 HEADERS = {
@@ -31,28 +31,22 @@ HEADERS = {
 }
 
 
-def new_nse_session():
-    session = requests.Session(impersonate="chrome")
-    session.headers.update(HEADERS)
-    session.get(NSE_HOME, timeout=20)
-    return session
+def nse_get(url, timeout=30):
+    s = requests.Session(impersonate="chrome")
+    s.headers.update(HEADERS)
+    r = s.get(url, timeout=timeout)
+    r.raise_for_status()
+    return r
 
 
 @st.cache_data(ttl=3600)
 def get_constituents(universe):
-    url = INDEX_FILES[universe]
-
-    # NSE's official index constituent CSV.
-    s = new_nse_session()
-    r = s.get(url, timeout=20)
-    r.raise_for_status()
-
+    r = nse_get(INDEX_FILES[universe], timeout=20)
     df = pd.read_csv(io.BytesIO(r.content))
     df.columns = [str(c).strip() for c in df.columns]
 
     symbol_col = next(
-        (c for c in df.columns if c.lower() == "symbol"),
-        None,
+        (c for c in df.columns if c.lower() == "symbol"), None
     )
     company_col = next(
         (
@@ -63,99 +57,164 @@ def get_constituents(universe):
     )
 
     if symbol_col is None:
-        raise RuntimeError("NSE index CSV does not contain a Symbol column.")
+        raise RuntimeError("NSE index file does not contain a Symbol column.")
 
     out = pd.DataFrame()
     out["Symbol"] = df[symbol_col].astype(str).str.strip().str.upper()
-
-    if company_col:
-        out["Company"] = df[company_col].astype(str).str.strip()
-    else:
-        out["Company"] = out["Symbol"]
+    out["Company"] = (
+        df[company_col].astype(str).str.strip()
+        if company_col
+        else out["Symbol"]
+    )
 
     return out.drop_duplicates("Symbol").reset_index(drop=True)
 
 
-def parse_market_cap(value):
-    if value is None:
-        return None
+def trading_dates_back(start_date, count=10):
+    dates = []
+    d = start_date
 
-    if isinstance(value, (int, float)):
-        return float(value)
+    while len(dates) < count:
+        if d.weekday() < 5:
+            dates.append(d)
+        d -= timedelta(days=1)
 
-    text = str(value).strip().replace(",", "").replace("₹", "")
-    try:
-        return float(text)
-    except ValueError:
-        return None
-
-
-def fetch_one_market_cap(symbol):
-    """
-    NSE quote-equity trade_info returns totalMarketCap for the security.
-    This is NSE data; no Yahoo Finance market-cap data is used.
-    """
-    s = new_nse_session()
-
-    quote_page = f"{NSE_HOME}/get-quotes/equity?symbol={symbol}"
-    api_url = f"{NSE_HOME}/api/quote-equity"
-
-    # Open the quote page first so NSE can establish the required session.
-    page = s.get(quote_page, timeout=20)
-    page.raise_for_status()
-
-    r = s.get(
-        api_url,
-        params={"symbol": symbol, "section": "trade_info"},
-        timeout=20,
-        headers={"Referer": quote_page},
-    )
-    r.raise_for_status()
-
-    data = r.json()
-    trade_info = (
-        data.get("marketDeptOrderBook", {})
-        .get("tradeInfo", {})
-    )
-
-    market_cap = trade_info.get("totalMarketCap")
-
-    if market_cap is None:
-        raise RuntimeError(f"NSE returned no total market cap for {symbol}.")
-
-    return symbol, parse_market_cap(market_cap)
+    return dates
 
 
 @st.cache_data(ttl=300)
-def get_market_caps(symbols):
-    results = {}
+def get_nse_market_cap_report():
+    """
+    NSE's official PR bundle contains:
+        mcapDDMMYYYY.csv
 
-    # Parallel requests make Nifty 100 refresh substantially faster.
-    with ThreadPoolExecutor(max_workers=8) as executor:
-        futures = {
-            executor.submit(fetch_one_market_cap, symbol): symbol
-            for symbol in symbols
-        }
+    This is the NSE security-wise market-cap report. We download the
+    latest available trading-day PR bundle and extract only its mcap file.
+    """
+    today = datetime.now(ZoneInfo("Asia/Kolkata")).date()
 
-        for future in as_completed(futures):
-            symbol = futures[future]
-            try:
-                sym, cap = future.result()
-                results[sym] = cap
-            except Exception:
-                results[symbol] = None
+    errors = []
 
-    return results
+    for d in trading_dates_back(today, count=8):
+        ddmmyyyy = d.strftime("%d%m%Y")
+        ddmmyy = d.strftime("%d%m%y")
+        month = d.strftime("%b").upper()
+
+        # NSE PR archive pattern.
+        url = (
+            f"{NSE_ARCHIVE}/content/historical/EQUITIES/"
+            f"{d.year}/{month}/PR{ddmmyy}.zip"
+        )
+
+        try:
+            r = nse_get(url, timeout=40)
+
+            with zipfile.ZipFile(io.BytesIO(r.content)) as z:
+                names = z.namelist()
+
+                target = next(
+                    (
+                        name for name in names
+                        if name.lower().endswith(f"mcap{ddmmyyyy}.csv")
+                    ),
+                    None,
+                )
+
+                # Be tolerant of an unexpected internal path/name.
+                if target is None:
+                    target = next(
+                        (
+                            name for name in names
+                            if "mcap" in name.lower()
+                            and name.lower().endswith(".csv")
+                        ),
+                        None,
+                    )
+
+                if target is None:
+                    raise RuntimeError(
+                        "NSE PR bundle was downloaded but its mcap CSV was not found."
+                    )
+
+                with z.open(target) as f:
+                    raw = pd.read_csv(f)
+
+            return raw, d
+
+        except Exception as e:
+            errors.append(f"{d}: {e}")
+
+    raise RuntimeError(
+        "Could not retrieve an NSE market-cap report from the recent "
+        "trading-day archives. " + " | ".join(errors[-3:])
+    )
+
+
+def normalize_market_cap_report(raw):
+    df = raw.copy()
+    df.columns = [str(c).strip() for c in df.columns]
+
+    # Find the security symbol column.
+    symbol_col = next(
+        (
+            c for c in df.columns
+            if c.lower() in {
+                "symbol",
+                "security symbol",
+                "nse symbol",
+                "symbol name",
+            }
+        ),
+        None,
+    )
+
+    # Find market-cap column.
+    cap_col = next(
+        (
+            c for c in df.columns
+            if "market" in c.lower()
+            and "capital" in c.lower()
+        ),
+        None,
+    )
+
+    if symbol_col is None or cap_col is None:
+        raise RuntimeError(
+            "NSE market-cap report format changed. "
+            f"Columns received: {list(df.columns)}"
+        )
+
+    out = pd.DataFrame()
+    out["Symbol"] = (
+        df[symbol_col]
+        .astype(str)
+        .str.strip()
+        .str.upper()
+    )
+
+    out["Market Cap (₹ Cr)"] = pd.to_numeric(
+        df[cap_col]
+        .astype(str)
+        .str.replace(",", "", regex=False)
+        .str.replace("₹", "", regex=False)
+        .str.strip(),
+        errors="coerce",
+    )
+
+    return out.dropna(subset=["Market Cap (₹ Cr)"]).drop_duplicates("Symbol")
 
 
 def build_table(universe):
     constituents = get_constituents(universe)
-    caps = get_market_caps(constituents["Symbol"].tolist())
+    raw, report_date = get_nse_market_cap_report()
+    market_caps = normalize_market_cap_report(raw)
 
-    out = constituents.copy()
-    out["Market Cap (₹ Cr)"] = out["Symbol"].map(caps)
+    out = constituents.merge(
+        market_caps,
+        on="Symbol",
+        how="left",
+    )
 
-    # Largest market cap first.
     out = out.sort_values(
         "Market Cap (₹ Cr)",
         ascending=False,
@@ -164,7 +223,10 @@ def build_table(universe):
 
     out.insert(0, "Rank", range(1, len(out) + 1))
 
-    return out[["Rank", "Symbol", "Company", "Market Cap (₹ Cr)"]]
+    return (
+        out[["Rank", "Symbol", "Company", "Market Cap (₹ Cr)"]],
+        report_date,
+    )
 
 
 st.title("📊 NSE Market Cap Scanner")
@@ -185,16 +247,19 @@ with col2:
 
 if refresh:
     get_constituents.clear()
-    get_market_caps.clear()
+    get_nse_market_cap_report.clear()
     st.rerun()
 
 try:
-    table = build_table(universe)
+    table, report_date = build_table(universe)
 
     now = datetime.now(ZoneInfo("Asia/Kolkata"))
+
     st.caption(
         "Last updated: "
         + now.strftime("%d-%m-%Y %I:%M:%S %p IST")
+        + "  |  NSE market-cap report: "
+        + report_date.strftime("%d-%m-%Y")
     )
 
     st.dataframe(
@@ -216,10 +281,12 @@ try:
     )
 
     missing = int(table["Market Cap (₹ Cr)"].isna().sum())
+
     if missing:
         st.warning(
-            f"NSE did not return market-cap data for {missing} stock(s). "
-            "Those rows are left blank rather than using another data source."
+            f"NSE market-cap data was not available for {missing} "
+            "constituent(s) in the selected universe. "
+            "Those rows are left blank."
         )
 
 except Exception as e:
